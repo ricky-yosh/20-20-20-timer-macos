@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = SCRIPT_DIR.parent
+CORE_DIR = ROOT / "TimerCore"
+APP_DIR = ROOT / "20-20-20-timer"
+CORE_SOURCES_DIR = CORE_DIR / "Sources" / "TimerCore"
+APP_SOURCES_DIR = APP_DIR / "20-20-20-timer"
+PROJECT_FILE = APP_DIR / "20-20-20-timer.xcodeproj" / "project.xcproj"
+APP_PRODUCT = "20-20-20-timer"
+CORE_PRODUCT = "TimerCore"
+
+ALLOWED_CORE_IMPORTS = {"Swift", "Foundation", "_Concurrency"}
+
+IMPORT_RE = re.compile(
+    r"(?:@[A-Za-z_][A-Za-z0-9_]*(?:\([^\n]*?\))?[ \t]+)*"
+    r"\bimport\b[ \t]+"
+    r"(?:(?:typealias|struct|class|enum|protocol|let|var|func|submodule)[ \t]+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+BANNED_PATTERNS = [
+    (re.compile(r"\bTask[ \t]*\.[ \t]*detached\b"), "Task.detached"),
+    (re.compile(r"@unchecked[ \t]+Sendable\b"), "@unchecked Sendable"),
+    (re.compile(r"\bnonisolated[ \t]*\([ \t]*unsafe[ \t]*\)"), "nonisolated(unsafe)"),
+]
+
+ALLOWED_COMMENT_PATTERNS = [
+    re.compile(r"\bSPDX-License-Identifier\b", re.I),
+    re.compile(r"\bCopyright\b", re.I),
+    re.compile(r"\bLicensed under\b", re.I),
+    re.compile(r"\bMIT License\b", re.I),
+    re.compile(r"\bApache License\b", re.I),
+    re.compile(r"\bBSD[- ]?License\b", re.I),
+    re.compile(r"\bGNU General Public License\b", re.I),
+    re.compile(r"\bswiftlint\s*:", re.I),
+    re.compile(r"\bswift-format-ignore-file\b", re.I),
+    re.compile(r"\bswiftformat\s*:", re.I),
+    re.compile(r"\bsourcery\s*:", re.I),
+    re.compile(r"@formatter\s*:\s*(?:off|on)\b", re.I),
+    re.compile(r"\bclang-format\b", re.I),
+    re.compile(r"\bswift-tools-version\s*:", re.I),
+]
+
+SKIP_DIR_PARTS = {".build", "build", "DerivedData", ".swiftpm", "Pods"}
+
+
+def scan_swift(text):
+    out = []
+    comments = []
+    i = 0
+    line = 1
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "#":
+            m = re.match(r'(#+)"', text[i:])
+            if m:
+                hashes = len(m.group(1))
+                closing = '"' + ("#" * hashes)
+                j = i + hashes + 1
+                end = text.find(closing, j)
+                stop = n if end == -1 else end + len(closing)
+                segment = text[i:stop]
+                line += segment.count("\n")
+                out.append("\n" * segment.count("\n"))
+                i = stop
+                continue
+        if ch == '"':
+            if text.startswith('"""', i):
+                end = text.find('"""', i + 3)
+                stop = n if end == -1 else end + 3
+                segment = text[i:stop]
+                line += segment.count("\n")
+                out.append("\n" * segment.count("\n"))
+                i = stop
+            else:
+                j = i + 1
+                while j < n:
+                    if text[j] == "\\":
+                        j += 2
+                        continue
+                    if text[j] == '"':
+                        j += 1
+                        break
+                    if text[j] == "\n":
+                        break
+                    j += 1
+                segment = text[i:j]
+                line += segment.count("\n")
+                out.append("\n" * segment.count("\n"))
+                i = j
+            continue
+        if text.startswith("//", i):
+            end = text.find("\n", i + 2)
+            if end == -1:
+                end = n
+            comments.append((line, text[i:end], "line"))
+            i = end
+            continue
+        if text.startswith("/*", i):
+            start_line = line
+            depth = 1
+            j = i + 2
+            while j < n and depth > 0:
+                if text.startswith("/*", j):
+                    depth += 1
+                    j += 2
+                elif text.startswith("*/", j):
+                    depth -= 1
+                    j += 2
+                else:
+                    if text[j] == "\n":
+                        line += 1
+                    j += 1
+            segment = text[i:j]
+            comments.append((start_line, segment, "block"))
+            out.append("\n" * segment.count("\n"))
+            i = j
+            continue
+        out.append(ch)
+        if ch == "\n":
+            line += 1
+        i += 1
+    return "".join(out), comments
+
+
+def discover(directory):
+    if not directory.is_dir():
+        return []
+    found = []
+    for path in directory.rglob("*.swift"):
+        parts = path.relative_to(directory).parts
+        if any(p in SKIP_DIR_PARTS or p.startswith(".") for p in parts[:-1]):
+            continue
+        found.append(path)
+    return sorted(found)
+
+
+def check_sources(core_files, app_files):
+    failures = []
+    if not core_files:
+        failures.append("no TimerCore production Swift files discovered")
+    if not app_files:
+        failures.append("no app production Swift files discovered")
+    for files, is_core in ((core_files, True), (app_files, False)):
+        for path in files:
+            rel = path.relative_to(ROOT)
+            text = path.read_text(encoding="utf-8")
+            code, comments = scan_swift(text)
+            for match in IMPORT_RE.finditer(code):
+                module = match.group(1)
+                if is_core and module not in ALLOWED_CORE_IMPORTS:
+                    failures.append(
+                        f"{rel}: forbidden TimerCore import '{module}' "
+                        "(only Swift standard modules and Foundation are allowed)"
+                    )
+            for pattern, label in BANNED_PATTERNS:
+                if pattern.search(code):
+                    failures.append(f"{rel}: banned concurrency escape hatch '{label}'")
+            for line, comment, _ in comments:
+                if not any(p.search(comment) for p in ALLOWED_COMMENT_PATTERNS):
+                    failures.append(f"{rel}:{line}: handwritten implementation comment is not allowed")
+    return failures
+
+
+def swiftpm_dependency_names(dep):
+    if isinstance(dep, str):
+        return [dep]
+    if not isinstance(dep, dict):
+        return []
+    names = []
+    for key in ("byName", "name", "product", "target"):
+        value = dep.get(key)
+        if isinstance(value, str):
+            names.append(value)
+        elif isinstance(value, list):
+            names.extend(item for item in value if isinstance(item, str))
+    return names
+
+
+def check_package_graph():
+    failures = []
+    if not (CORE_DIR / "Package.swift").is_file():
+        return ["TimerCore/Package.swift is missing"]
+    try:
+        with tempfile.TemporaryDirectory(prefix="timer-arch-") as scratch:
+            proc = subprocess.run(
+                ["swift", "package", "--scratch-path", scratch, "dump-package"],
+                cwd=str(CORE_DIR),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [f"unable to run swift package dump-package: {exc}"]
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")[:400]
+        return [f"swift package dump-package failed: {detail}"]
+    try:
+        manifest = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return [f"could not parse swift package dump-package output: {exc}"]
+    for dep in manifest.get("dependencies") or []:
+        failures.append(
+            f"TimerCore declares package dependency "
+            f"'{json.dumps(dep, sort_keys=True)}' (core must be dependency-free)"
+        )
+    targets = [t for t in manifest.get("targets") or [] if isinstance(t, dict)]
+    production_target = next(
+        (t for t in targets if t.get("name") == CORE_PRODUCT), None
+    )
+    if production_target is None:
+        failures.append(f"TimerCore package has no production target named '{CORE_PRODUCT}'")
+    else:
+        deps = production_target.get("dependencies") or []
+        if deps:
+            failures.append(
+                f"SwiftPM production target '{CORE_PRODUCT}' must have an empty "
+                f"dependency list (found {json.dumps(deps, sort_keys=True)})"
+            )
+    for target in targets:
+        for dep in target.get("dependencies") or []:
+            for name in swiftpm_dependency_names(dep):
+                if APP_PRODUCT in name or "20-20-20" in name:
+                    failures.append(
+                        f"TimerCore target '{target.get('name')}' depends on app product "
+                        f"'{name}' (reverse dependency)"
+                    )
+    return failures
+
+
+def load_jsonish(path):
+    text = path.read_text(encoding="utf-8")
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    return json.loads(text)
+
+
+def path_is_core_rooted(value):
+    path = str(value or "").replace("\\", "/").rstrip("/")
+    return CORE_PRODUCT in [part for part in path.split("/") if part]
+
+
+def xcode_target_depends_on_app(target):
+    for key in (
+        "package-product-members",
+        "packageProductMembers",
+        "dependencies",
+        "targetDependencies",
+    ):
+        value = target.get(key)
+        if value is None:
+            continue
+        blob = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+        if APP_PRODUCT in blob or "20-20-20" in blob:
+            return True
+    return False
+
+
+def check_xcode_graph():
+    failures = []
+    if not PROJECT_FILE.is_file():
+        return [f"missing {PROJECT_FILE.relative_to(ROOT)}"]
+    try:
+        project = load_jsonish(PROJECT_FILE)
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"cannot parse project.xcproj: {exc}"]
+
+    packages = project.get("packages")
+    if packages is None:
+        packages = project.get("Packages", [])
+    entries = []
+    if isinstance(packages, dict):
+        entries = list(packages.items())
+    elif isinstance(packages, list):
+        entries = [(str(index), value) for index, value in enumerate(packages)]
+
+    core_entry = None
+    for key, value in entries:
+        obj = value if isinstance(value, dict) else {"value": value}
+        path = str(obj.get("path", "")).replace("\\", "/").rstrip("/")
+        kind = str(obj.get("kind", ""))
+        if path.endswith("/TimerCore") or path == "../TimerCore" or path == "TimerCore":
+            if kind and kind.lower() != "local":
+                failures.append(
+                    f"Xcode package '{key}' for TimerCore has kind '{kind}', expected 'local'"
+                )
+            core_entry = (key, obj)
+    if core_entry is None:
+        failures.append("Xcode project has no local package declaration for ../TimerCore")
+    else:
+        key, obj = core_entry
+        if APP_PRODUCT in json.dumps(obj, sort_keys=True) or "20-20-20" in json.dumps(obj, sort_keys=True):
+            failures.append(f"Xcode package '{key}' declares a reverse dependency on the app")
+
+    targets = project.get("targets") or []
+    app_target = next(
+        (t for t in targets if isinstance(t, dict) and t.get("name") == APP_PRODUCT),
+        None,
+    )
+    if app_target is None:
+        failures.append(f"Xcode project has no target named '{APP_PRODUCT}'")
+    else:
+        members = None
+        for key in ("package-product-members", "packageProductMembers"):
+            if key in app_target:
+                members = app_target[key]
+                break
+        found = False
+        if isinstance(members, list):
+            for member in members:
+                if isinstance(member, str) and member == CORE_PRODUCT:
+                    found = True
+                elif isinstance(member, dict) and any(
+                    member.get(k) == CORE_PRODUCT
+                    for k in ("package", "product-name", "product", "name")
+                ):
+                    found = True
+        if not found:
+            failures.append(f"app target lacks package-product-members for '{CORE_PRODUCT}'")
+
+    core_rooted_targets = set()
+    for entry in project.get("files") or []:
+        if not isinstance(entry, dict) or not path_is_core_rooted(entry.get("path")):
+            continue
+        membership = entry.get("target-membership") or []
+        if isinstance(membership, str):
+            membership = [membership]
+        for member in membership:
+            if isinstance(member, str):
+                core_rooted_targets.add(member)
+
+    for target in targets:
+        if not isinstance(target, dict) or target.get("name") == APP_PRODUCT:
+            continue
+        if not xcode_target_depends_on_app(target):
+            continue
+        name = str(target.get("name") or "")
+        core_scope = name == CORE_PRODUCT or name in core_rooted_targets or any(
+            path_is_core_rooted(target.get(key))
+            for key in ("path", "sources", "sourceTree")
+        )
+        if core_scope:
+            failures.append(
+                f"Xcode target '{name}' in TimerCore scope declares a reverse "
+                "dependency on the app"
+            )
+        else:
+            failures.append(
+                f"Xcode target '{name}' has a reverse dependency on the app"
+            )
+    return failures
+
+
+def main():
+    core_files = discover(CORE_SOURCES_DIR)
+    app_files = discover(APP_SOURCES_DIR)
+    print("== Architecture guard ==")
+    print(f"TimerCore production Swift files: {len(core_files)}")
+    for path in core_files:
+        print(f"  {path.relative_to(ROOT)}")
+    print(f"App production Swift files: {len(app_files)}")
+    for path in app_files:
+        print(f"  {path.relative_to(ROOT)}")
+
+    failures = []
+    failures.extend(check_sources(core_files, app_files))
+    failures.extend(check_package_graph())
+    failures.extend(check_xcode_graph())
+
+    print()
+    if failures:
+        print(f"FAIL: {len(failures)} architecture violation(s):")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
+    print("PASS: architecture checks passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
