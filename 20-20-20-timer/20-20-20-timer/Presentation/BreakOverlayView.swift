@@ -30,7 +30,7 @@ struct BreakOverlayView: View {
 
     var body: some View {
         ZStack {
-            ShiftingBreakBackground()
+            CharcoalBackground()
 
             if showsControls {
                 TimelineView(.periodic(from: .now, by: refreshInterval)) { _ in

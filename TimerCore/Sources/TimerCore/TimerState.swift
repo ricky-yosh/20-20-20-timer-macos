@@ -1,22 +1,34 @@
 public struct TimerState: Sendable, Equatable {
     public let configuration: TimerConfiguration
     public private(set) var phase: TimerPhase
+    public private(set) var checkInSettings: CheckInSettings
+    public private(set) var activeCheckIn: ActiveCheckIn?
 
     private var nextTransition: ContinuousClock.Instant?
+    private var nextCheckIn: ScheduledCheckIn?
+    private var workAnchor: ContinuousClock.Instant
     private var suspendedResume: SuspendedResume?
     private var onDemandRestore: OnDemandRestore?
 
-    public init(configuration: TimerConfiguration = .productDefault, now: ContinuousClock.Instant) {
+    public init(
+        configuration: TimerConfiguration = .productDefault,
+        checkInSettings: CheckInSettings = .productDefault,
+        now: ContinuousClock.Instant
+    ) {
         self.configuration = configuration
+        self.checkInSettings = checkInSettings
         self.onDemandRestore = nil
         self.suspendedResume = nil
+        self.activeCheckIn = nil
+        self.workAnchor = now
         self.phase = .work(deadline: now + configuration.workInterval, warning: .none)
         self.nextTransition = nil
-        applyWork(deadline: now + configuration.workInterval, at: now)
+        self.nextCheckIn = nil
+        beginWork(deadline: now + configuration.workInterval, at: now)
     }
 
     public var nextDeadline: ContinuousClock.Instant? {
-        nextTransition
+        [nextTransition, nextCheckIn?.due, activeCheckIn?.expiresAt].compactMap { $0 }.min()
     }
 
     public mutating func handle(_ event: TimerEvent, now: ContinuousClock.Instant) {
@@ -42,29 +54,40 @@ public struct TimerState: Sendable, Equatable {
         case .dismissBreak:
             advance(to: now)
             dismissBreak(at: now)
+        case .dismissCheckIn:
+            dismissCheckIn()
+        case .updateCheckInSettings(let settings):
+            update(settings, at: now)
         }
     }
 
     private mutating func advance(to now: ContinuousClock.Instant) {
+        if let active = activeCheckIn, now >= active.expiresAt {
+            activeCheckIn = nil
+        }
         switch phase {
         case .work(let deadline, _):
             if now >= deadline {
                 startScheduledBreak(at: now)
             } else {
+                let dueCheckIn = nextCheckIn
                 applyWork(deadline: deadline, at: now)
+                activateDueCheckIn(dueCheckIn, at: now)
             }
         case .onBreak(let deadline, let origin):
+            clearCheckIn()
             if now >= deadline {
                 completeBreak(origin: origin, at: now)
             }
         case .paused, .suspended:
-            break
+            clearCheckIn()
         }
     }
 
     private mutating func pause(at now: ContinuousClock.Instant) {
         switch phase {
         case .work(let deadline, _):
+            clearCheckIn()
             phase = .paused(remaining: deadline - now)
             nextTransition = nil
         case .paused, .onBreak, .suspended:
@@ -75,7 +98,7 @@ public struct TimerState: Sendable, Equatable {
     private mutating func resume(at now: ContinuousClock.Instant) {
         switch phase {
         case .paused(let remaining):
-            applyWork(deadline: now + remaining, at: now)
+            beginWork(deadline: now + remaining, at: now)
         case .work, .onBreak, .suspended:
             break
         }
@@ -130,7 +153,20 @@ public struct TimerState: Sendable, Equatable {
         }
     }
 
+    private mutating func dismissCheckIn() {
+        activeCheckIn = nil
+    }
+
+    private mutating func update(_ settings: CheckInSettings, at now: ContinuousClock.Instant) {
+        checkInSettings = settings
+        if let active = activeCheckIn, !settings.isEnabled(active.origin) {
+            activeCheckIn = nil
+        }
+        refreshCheckInSchedule(at: now)
+    }
+
     private mutating func screenBecameUnavailable(at now: ContinuousClock.Instant) {
+        clearCheckIn()
         switch phase {
         case .work(let deadline, _):
             if deadline - now <= configuration.finalWarningDuration {
@@ -165,12 +201,13 @@ public struct TimerState: Sendable, Equatable {
             suspendedResume = nil
             switch resume {
             case .work(let remaining)?:
-                applyWork(deadline: now + remaining, at: now)
+                beginWork(deadline: now + remaining, at: now)
             case .finalWarning?:
-                applyWork(deadline: now + configuration.finalWarningDuration, at: now)
+                beginWork(deadline: now + configuration.finalWarningDuration, at: now)
             case .paused(let remaining)?:
                 phase = .paused(remaining: remaining)
                 nextTransition = nil
+                clearCheckIn()
             case .freshWorkInterval?, nil:
                 startWorkInterval(at: now)
             }
@@ -191,6 +228,7 @@ public struct TimerState: Sendable, Equatable {
             case .paused(_)?:
                 phase = .paused(remaining: configuration.workInterval)
                 nextTransition = nil
+                clearCheckIn()
             case .work(_)?, nil:
                 startWorkInterval(at: now)
             }
@@ -202,30 +240,33 @@ public struct TimerState: Sendable, Equatable {
         onDemandRestore = nil
         switch restore {
         case .work(let remaining)?:
-            applyWork(deadline: now + remaining, at: now)
+            beginWork(deadline: now + remaining, at: now)
         case .paused(let remaining)?:
             phase = .paused(remaining: remaining)
             nextTransition = nil
+            clearCheckIn()
         case nil:
             startWorkInterval(at: now)
         }
     }
 
     private mutating func suspend() {
+        clearCheckIn()
         phase = .suspended
         nextTransition = nil
     }
 
     private mutating func startWorkInterval(at now: ContinuousClock.Instant) {
-        applyWork(deadline: now + configuration.workInterval, at: now)
+        beginWork(deadline: now + configuration.workInterval, at: now)
     }
 
     private mutating func startSnoozedWork(at now: ContinuousClock.Instant) {
         onDemandRestore = nil
-        applyWork(deadline: now + configuration.snoozeInterval, at: now)
+        beginWork(deadline: now + configuration.snoozeInterval, at: now)
     }
 
     private mutating func startScheduledBreak(at now: ContinuousClock.Instant) {
+        clearCheckIn()
         onDemandRestore = nil
         let deadline = now + configuration.breakDuration
         phase = .onBreak(deadline: deadline, origin: .scheduled)
@@ -233,15 +274,80 @@ public struct TimerState: Sendable, Equatable {
     }
 
     private mutating func startOnDemandBreak(at now: ContinuousClock.Instant) {
+        clearCheckIn()
         let deadline = now + configuration.breakDuration
         phase = .onBreak(deadline: deadline, origin: .onDemand)
         nextTransition = deadline
+    }
+
+    private mutating func beginWork(deadline: ContinuousClock.Instant, at now: ContinuousClock.Instant) {
+        workAnchor = now
+        clearCheckIn()
+        applyWork(deadline: deadline, at: now)
     }
 
     private mutating func applyWork(deadline: ContinuousClock.Instant, at now: ContinuousClock.Instant) {
         let timeline = workTimeline(deadline: deadline, now: now)
         phase = .work(deadline: deadline, warning: timeline.warning)
         nextTransition = timeline.next
+        refreshCheckInSchedule(at: now)
+    }
+
+    private mutating func clearCheckIn() {
+        activeCheckIn = nil
+        nextCheckIn = nil
+    }
+
+    private mutating func refreshCheckInSchedule(at now: ContinuousClock.Instant) {
+        guard case .work(let deadline, let warning) = phase else {
+            nextCheckIn = nil
+            return
+        }
+        guard warning == .none else {
+            clearCheckIn()
+            return
+        }
+        if let active = activeCheckIn, !checkInSettings.isEnabled(active.origin) {
+            activeCheckIn = nil
+        }
+        nextCheckIn = scheduledCheckIn(after: now, deadline: deadline)
+    }
+
+    private mutating func activateDueCheckIn(
+        _ scheduled: ScheduledCheckIn?,
+        at now: ContinuousClock.Instant
+    ) {
+        guard case .work(_, let warning) = phase, warning == .none else { return }
+        guard activeCheckIn == nil else { return }
+        guard let scheduled, scheduled.due <= now else { return }
+        let isStale = now >= scheduled.due + configuration.checkInDuration
+        if !isStale, checkInSettings.isEnabled(scheduled.origin) {
+            activeCheckIn = ActiveCheckIn(
+                origin: scheduled.origin,
+                expiresAt: now + configuration.checkInDuration
+            )
+        }
+    }
+
+    private func scheduledCheckIn(
+        after now: ContinuousClock.Instant,
+        deadline: ContinuousClock.Instant
+    ) -> ScheduledCheckIn? {
+        let warningStart = deadline - configuration.headsUpLead
+        var candidates: [ScheduledCheckIn] = []
+        if checkInSettings.blinkEnabled {
+            candidates.append(contentsOf: configuration.blinkCheckInOffsets.map {
+                ScheduledCheckIn(origin: .blink, due: workAnchor + $0)
+            })
+        }
+        if checkInSettings.postureEnabled {
+            candidates.append(contentsOf: configuration.postureCheckInOffsets.map {
+                ScheduledCheckIn(origin: .posture, due: workAnchor + $0)
+            })
+        }
+        return candidates
+            .filter { $0.due > now && $0.due < warningStart }
+            .min { $0.due < $1.due }
     }
 
     private func workTimeline(
@@ -265,6 +371,11 @@ public struct TimerState: Sendable, Equatable {
         let next = boundaries.filter { $0 > now }.min() ?? deadline
         return (warning, next)
     }
+}
+
+private struct ScheduledCheckIn: Sendable, Equatable {
+    let origin: CheckInOrigin
+    let due: ContinuousClock.Instant
 }
 
 private enum SuspendedResume: Sendable, Equatable {

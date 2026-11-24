@@ -54,6 +54,7 @@ final class TimerPlatform {
 
     private var headsUpPanel: NSPanel?
     private var countdownPanel: NSPanel?
+    private var checkInPanel: NSPanel?
     private var countdownRefreshTask: Task<Void, Never>?
     private var countdownGeneration = 0
 
@@ -96,7 +97,7 @@ final class TimerPlatform {
     }
 
     func showHeadsUp(snooze: @escaping @MainActor () -> Void) {
-        clearWarnings()
+        clearFloatingPanels()
         let panel = makePassivePanel(level: .statusBar, ignoresMouseEvents: false)
         let dismissAction: @MainActor () -> Void = { [weak self] in
             snooze()
@@ -109,8 +110,22 @@ final class TimerPlatform {
         fadeIn(panel)
     }
 
+    func showCheckIn(origin: CheckInOrigin, dismiss: @escaping @MainActor () -> Void) {
+        clearFloatingPanels()
+        let panel = makePassivePanel(level: .statusBar, ignoresMouseEvents: false)
+        let dismissAction: @MainActor () -> Void = { [weak self] in
+            dismiss()
+            self?.dismissCheckIn()
+        }
+        panel.contentView = NSHostingView(rootView: CheckInView(origin: origin, dismiss: dismissAction))
+        panel.setContentSize(NSSize(width: 300, height: 96))
+        placeHeadsUp(panel)
+        checkInPanel = panel
+        fadeIn(panel)
+    }
+
     func showFinalCountdown(deadline: ContinuousClock.Instant) {
-        clearWarnings()
+        clearFloatingPanels()
         let panel = makePassivePanel(level: warningLevel, ignoresMouseEvents: true)
         panel.contentView = NSHostingView(rootView: FinalCountdownView(deadline: deadline))
         panel.setContentSize(NSSize(width: 52, height: 52))
@@ -126,7 +141,7 @@ final class TimerPlatform {
         dismiss: @escaping @MainActor () -> Void,
         snooze: (@MainActor () -> Void)? = nil
     ) {
-        clearWarnings()
+        clearFloatingPanels()
         let isNewBreak = activeBreak?.deadline != deadline
         let presentation = BreakPresentation(deadline: deadline, origin: origin, dismiss: dismiss, snooze: snooze)
         activeBreak = presentation
@@ -145,7 +160,7 @@ final class TimerPlatform {
     }
 
     func clear() {
-        clearWarnings()
+        clearFloatingPanels()
         finishBreak()
     }
 
@@ -209,6 +224,9 @@ final class TimerPlatform {
         }
         if let headsUpPanel {
             placeHeadsUp(headsUpPanel)
+        }
+        if let checkInPanel {
+            placeHeadsUp(checkInPanel)
         }
         onDisplayChange?()
     }
@@ -362,13 +380,20 @@ final class TimerPlatform {
         fadeOut(panel)
     }
 
-    private func clearWarnings() {
+    private func dismissCheckIn() {
+        guard let panel = checkInPanel else { return }
+        checkInPanel = nil
+        fadeOut(panel)
+    }
+
+    private func clearFloatingPanels() {
         countdownGeneration += 1
         countdownRefreshTask?.cancel()
         countdownRefreshTask = nil
-        let panels = [headsUpPanel, countdownPanel].compactMap { $0 }
+        let panels = [headsUpPanel, countdownPanel, checkInPanel].compactMap { $0 }
         headsUpPanel = nil
         countdownPanel = nil
+        checkInPanel = nil
         for panel in panels {
             fadeOut(panel)
         }

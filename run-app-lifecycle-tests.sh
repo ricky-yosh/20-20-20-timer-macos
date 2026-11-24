@@ -16,7 +16,10 @@ swiftc -swift-version 6 -strict-concurrency=complete \
 
 swiftc -swift-version 6 -strict-concurrency=complete \
   -I "$BUILD/modules" -L "$BUILD/modules" -lTimerCore \
+  "$ROOT/20-20-20-timer/TimerCommandProtocol/TimerCommandProtocol.swift" \
+  "$ROOT/20-20-20-timer/20-20-20-timer/CheckInPreferences.swift" \
   "$ROOT/20-20-20-timer/20-20-20-timer/TimerController.swift" \
+  "$ROOT/20-20-20-timer/20-20-20-timer/TimerCommandService.swift" \
   "$ROOT/app-tests/TimerLifecycleHarness.swift" \
   -o "$BUILD/lifecycle-harness"
 

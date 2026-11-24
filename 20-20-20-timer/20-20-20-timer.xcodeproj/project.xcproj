@@ -10,6 +10,12 @@
       "Base",
     ],
   },
+  "packages": [
+    {
+      "kind": "local",
+      "path": "../TimerCore",
+    },
+  ],
   "files": [
     { "kind": "folder", "path": "20-20-20-timer", "target-membership": [ "20-20-20-timer" ] },
     {
@@ -17,21 +23,36 @@
       "name": "Products",
       "children": [
         { "path": "<PRODUCTS>/20-20-20-timer.app", "id": "000000000000000000000120", "type": "wrapper.application", "index": false },
+        { "path": "<PRODUCTS>/20-20-20-cli", "id": "841290CB30B62A8200339B29", "type": "compiled.mach-o.executable", "index": false },
+      ],
+    },
+    { "kind": "folder", "path": "TimerCommandProtocol", "target-membership": [ "20-20-20-cli", "20-20-20-timer" ] },
+    { "kind": "folder", "path": "20-20-20-cli", "target-membership": [ "20-20-20-cli" ] },
+    {
+      "kind": "group",
+      "name": "SharedCommands",
+      "children": [
+        { "path": "20-20-20-timer/Platform/TimerCommandTransport.swift", "target-membership": [ "20-20-20-cli/compile-sources" ] },
       ],
     },
   ],
-  "packages": [{ "kind": "local", "path": "../TimerCore" }],
   "targets": [
     {
       "name": "20-20-20-timer",
       "id": "000000000000000100000000",
       "product": "Products/20-20-20-timer.app",
       "product-type": "application",
-      "package-product-members": [{ "package": "TimerCore", "product-name": "TimerCore", "build-phase": { "build-phase": "frameworks" } }],
       "build-phases": [
         "compile-sources",
         "frameworks",
         "resources",
+      ],
+      "package-product-members": [
+        {
+          "package": "TimerCore",
+          "product-name": "TimerCore",
+          "build-phase": { "build-phase": "frameworks" },
+        },
       ],
       "build-settings": {
         "CODE_SIGN_STYLE": "Automatic",
@@ -40,6 +61,7 @@
         "ENABLE_PREVIEWS": "YES",
         "ENABLE_USER_SELECTED_FILES": "readonly",
         "GENERATE_INFOPLIST_FILE": "YES",
+        "INFOPLIST_KEY_LSUIElement": "YES",
         "INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]": "YES",
         "INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]": "YES",
         "INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]": "YES",
@@ -62,11 +84,35 @@
         "SWIFT_APPROACHABLE_CONCURRENCY": "YES",
         "SWIFT_DEFAULT_ACTOR_ISOLATION": "MainActor",
         "SWIFT_EMIT_LOC_STRINGS": "YES",
+        "SWIFT_STRICT_CONCURRENCY": "complete",
         "SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY": "YES",
         "SWIFT_VERSION": "6.0",
-        "SWIFT_STRICT_CONCURRENCY": "complete",
-        "INFOPLIST_KEY_LSUIElement": "YES",
         "TARGETED_DEVICE_FAMILY": "1,2,7",
+      },
+    }, {
+      "name": "20-20-20-cli",
+      "id": "841290CA30B62A8200339B29",
+      "product": "Products/20-20-20-cli",
+      "product-type": "tool",
+      "build-phases": [
+        "compile-sources",
+        "frameworks",
+      ],
+      "package-product-members": [
+        {
+          "package": "TimerCore",
+          "product-name": "TimerCore",
+          "build-phase": { "build-phase": "frameworks" },
+        },
+      ],
+      "build-settings": {
+        "CODE_SIGN_STYLE": "Automatic",
+        "PRODUCT_NAME": "20-20-20-cli",
+        "SDKROOT": "macosx",
+        "SWIFT_APPROACHABLE_CONCURRENCY": "YES",
+        "SWIFT_DEFAULT_ACTOR_ISOLATION": "MainActor",
+        "SWIFT_STRICT_CONCURRENCY": "complete",
+        "SWIFT_VERSION": "6.0",
       },
     },
   ],

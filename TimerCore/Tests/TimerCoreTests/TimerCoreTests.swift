@@ -15,6 +15,20 @@ final class TimerCoreTests: XCTestCase {
         )
     }
 
+    private var checkInShort: TimerConfiguration {
+        TimerConfiguration(
+            workInterval: .seconds(30),
+            breakDuration: .seconds(6),
+            snoozeInterval: .seconds(15),
+            headsUpLead: .seconds(10),
+            headsUpDuration: .seconds(2),
+            finalWarningDuration: .seconds(3),
+            checkInDuration: .seconds(2),
+            blinkCheckInOffsets: [.seconds(5), .seconds(15)],
+            postureCheckInOffsets: [.seconds(10)]
+        )
+    }
+
     func testProductDefaults() {
         let config = TimerConfiguration()
         XCTAssertEqual(config.workInterval, .seconds(20 * 60))
@@ -23,6 +37,9 @@ final class TimerCoreTests: XCTestCase {
         XCTAssertEqual(config.headsUpLead, .seconds(60))
         XCTAssertEqual(config.headsUpDuration, .seconds(8))
         XCTAssertEqual(config.finalWarningDuration, .seconds(5))
+        XCTAssertEqual(config.checkInDuration, .seconds(4))
+        XCTAssertEqual(config.blinkCheckInOffsets, [.seconds(5 * 60), .seconds(15 * 60)])
+        XCTAssertEqual(config.postureCheckInOffsets, [.seconds(10 * 60)])
     }
 
     func testInitialStatePointsAtHeadsUpBoundary() {
@@ -294,5 +311,191 @@ final class TimerCoreTests: XCTestCase {
         state.handle(.screenUnavailable, now: origin + .seconds(1))
         state.handle(.screenUnavailable, now: origin + .seconds(2))
         XCTAssertEqual(state.phase, .suspended)
+    }
+
+    func testBlinkCheckInActivatesAtOffsetAndExpires() {
+        var state = TimerState(configuration: checkInShort, now: origin)
+        XCTAssertEqual(state.nextDeadline, origin + .seconds(5))
+
+        state.handle(.deadlineReached, now: origin + .seconds(5))
+        XCTAssertEqual(
+            state.activeCheckIn,
+            ActiveCheckIn(origin: .blink, expiresAt: origin + .seconds(7))
+        )
+        XCTAssertEqual(state.nextDeadline, origin + .seconds(7))
+
+        state.handle(.deadlineReached, now: origin + .seconds(7))
+        XCTAssertNil(state.activeCheckIn)
+        XCTAssertEqual(state.phase, .work(deadline: origin + .seconds(30), warning: .none))
+        XCTAssertEqual(state.nextDeadline, origin + .seconds(10))
+    }
+
+    func testPostureCheckInUsesItsOwnCadence() {
+        var state = TimerState(configuration: checkInShort, now: origin)
+
+        state.handle(.deadlineReached, now: origin + .seconds(5))
+        state.handle(.deadlineReached, now: origin + .seconds(7))
+        state.handle(.deadlineReached, now: origin + .seconds(10))
+
+        XCTAssertEqual(
+            state.activeCheckIn,
+            ActiveCheckIn(origin: .posture, expiresAt: origin + .seconds(12))
+        )
+        XCTAssertEqual(state.nextDeadline, origin + .seconds(12))
+    }
+
+    func testDismissCheckInClearsPromptImmediately() {
+        var state = TimerState(configuration: checkInShort, now: origin)
+        state.handle(.deadlineReached, now: origin + .seconds(5))
+        XCTAssertNotNil(state.activeCheckIn)
+
+        state.handle(.dismissCheckIn, now: origin + .seconds(5))
+        XCTAssertNil(state.activeCheckIn)
+        XCTAssertEqual(state.nextDeadline, origin + .seconds(10))
+    }
+
+    func testCheckInSuppressedWhilePausedAndCadenceRestartsOnResume() {
+        var state = TimerState(configuration: checkInShort, now: origin)
+        state.handle(.pause, now: origin + .seconds(4))
+        XCTAssertNil(state.activeCheckIn)
+        XCTAssertNil(state.nextDeadline)
+
+        state.handle(.deadlineReached, now: origin + .seconds(5))
+        XCTAssertNil(state.activeCheckIn)
+        XCTAssertEqual(state.phase, .paused(remaining: .seconds(26)))
+
+        state.handle(.resume, now: origin + .seconds(100))
+        XCTAssertNil(state.activeCheckIn)
+        XCTAssertEqual(state.nextDeadline, origin + .seconds(105))
+    }
+
+    func testCheckInSuppressedDuringOnDemandBreak() {
+        var state = TimerState(configuration: checkInShort, now: origin)
+        state.handle(.takeBreakNow, now: origin + .seconds(4))
+        XCTAssertNil(state.activeCheckIn)
+
+        state.handle(.deadlineReached, now: origin + .seconds(5))
+        XCTAssertNil(state.activeCheckIn)
+        XCTAssertEqual(
+            state.phase,
+            .onBreak(deadline: origin + .seconds(10), origin: .onDemand)
+        )
+    }
+
+    func testBreakWarningSuppressesCheckInAtSameInstant() {
+        let configuration = TimerConfiguration(
+            workInterval: .seconds(30),
+            breakDuration: .seconds(6),
+            snoozeInterval: .seconds(15),
+            headsUpLead: .seconds(10),
+            headsUpDuration: .seconds(2),
+            finalWarningDuration: .seconds(3),
+            checkInDuration: .seconds(2),
+            blinkCheckInOffsets: [.seconds(20)],
+            postureCheckInOffsets: []
+        )
+        var state = TimerState(configuration: configuration, now: origin)
+        XCTAssertEqual(state.nextDeadline, origin + .seconds(20))
+
+        state.handle(.deadlineReached, now: origin + .seconds(20))
+        XCTAssertNil(state.activeCheckIn)
+        XCTAssertEqual(
+            state.phase,
+            .work(deadline: origin + .seconds(30), warning: .headsUp)
+        )
+    }
+
+    func testHeadsUpClearsActiveCheckIn() {
+        let configuration = TimerConfiguration(
+            workInterval: .seconds(30),
+            breakDuration: .seconds(6),
+            snoozeInterval: .seconds(15),
+            headsUpLead: .seconds(10),
+            headsUpDuration: .seconds(2),
+            finalWarningDuration: .seconds(3),
+            checkInDuration: .seconds(3),
+            blinkCheckInOffsets: [.seconds(18)],
+            postureCheckInOffsets: []
+        )
+        var state = TimerState(configuration: configuration, now: origin)
+        state.handle(.deadlineReached, now: origin + .seconds(18))
+        XCTAssertEqual(
+            state.activeCheckIn,
+            ActiveCheckIn(origin: .blink, expiresAt: origin + .seconds(21))
+        )
+
+        state.handle(.deadlineReached, now: origin + .seconds(20))
+        XCTAssertNil(state.activeCheckIn)
+        XCTAssertEqual(
+            state.phase,
+            .work(deadline: origin + .seconds(30), warning: .headsUp)
+        )
+    }
+
+    func testDisabledReminderDoesNotPromptWhileOtherStillRuns() {
+        let settings = CheckInSettings(blinkEnabled: false, postureEnabled: true)
+        var state = TimerState(
+            configuration: checkInShort,
+            checkInSettings: settings,
+            now: origin
+        )
+        XCTAssertEqual(state.nextDeadline, origin + .seconds(10))
+
+        state.handle(.deadlineReached, now: origin + .seconds(10))
+        XCTAssertEqual(state.activeCheckIn?.origin, .posture)
+
+        state.handle(.deadlineReached, now: origin + .seconds(12))
+        XCTAssertNil(state.activeCheckIn)
+        state.handle(.deadlineReached, now: origin + .seconds(15))
+        XCTAssertNil(state.activeCheckIn)
+    }
+
+    func testDisablingActiveReminderClearsPrompt() {
+        var state = TimerState(configuration: checkInShort, now: origin)
+        state.handle(.deadlineReached, now: origin + .seconds(5))
+        XCTAssertEqual(state.activeCheckIn?.origin, .blink)
+
+        state.handle(
+            .updateCheckInSettings(CheckInSettings(blinkEnabled: false, postureEnabled: true)),
+            now: origin + .seconds(5)
+        )
+        XCTAssertNil(state.activeCheckIn)
+        XCTAssertEqual(state.nextDeadline, origin + .seconds(10))
+    }
+
+    func testEnablingReminderSchedulesOnlyFutureOffsets() {
+        var state = TimerState(
+            configuration: checkInShort,
+            checkInSettings: CheckInSettings(blinkEnabled: false, postureEnabled: false),
+            now: origin
+        )
+        state.handle(.deadlineReached, now: origin + .seconds(6))
+        XCTAssertEqual(state.nextDeadline, origin + .seconds(20))
+
+        state.handle(
+            .updateCheckInSettings(.productDefault),
+            now: origin + .seconds(6)
+        )
+        XCTAssertNil(state.activeCheckIn)
+        XCTAssertEqual(state.nextDeadline, origin + .seconds(10))
+    }
+
+    func testScreenUnavailableSuppressesCheckInAndRestartsCadence() {
+        var state = TimerState(configuration: checkInShort, now: origin)
+        state.handle(.screenUnavailable, now: origin + .seconds(4))
+        XCTAssertNil(state.activeCheckIn)
+        XCTAssertNil(state.nextDeadline)
+
+        state.handle(.deadlineReached, now: origin + .seconds(6))
+        XCTAssertNil(state.activeCheckIn)
+        XCTAssertEqual(state.phase, .suspended)
+
+        state.handle(.screenAvailable, now: origin + .seconds(100))
+        XCTAssertNil(state.activeCheckIn)
+        XCTAssertEqual(
+            state.phase,
+            .work(deadline: origin + .seconds(126), warning: .none)
+        )
+        XCTAssertEqual(state.nextDeadline, origin + .seconds(105))
     }
 }

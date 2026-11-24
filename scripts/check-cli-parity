@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PROTOCOL = ROOT / "20-20-20-timer" / "TimerCommandProtocol" / "TimerCommandProtocol.swift"
+SERVICE = ROOT / "20-20-20-timer" / "20-20-20-timer" / "TimerCommandService.swift"
+CONTROLLER = ROOT / "20-20-20-timer" / "20-20-20-timer" / "TimerController.swift"
+HOST = ROOT / "20-20-20-timer" / "20-20-20-timer" / "Platform" / "TimerCommandHost.swift"
+MENU = ROOT / "20-20-20-timer" / "20-20-20-timer" / "Presentation" / "TimerMenu.swift"
+APP = ROOT / "20-20-20-timer" / "20-20-20-timer" / "MyApp.swift"
+CLI = ROOT / "20-20-20-timer" / "20-20-20-cli" / "TimerCLI.swift"
+
+GUI_EVENT_COMMANDS = [
+    "pause",
+    "resume",
+    "takeBreakNow",
+    "dismissBreak",
+    "snoozeBreak",
+    "dismissCheckIn",
+]
+GUI_MENU_COMMANDS = [
+    "pause",
+    "resume",
+    "takeBreakNow",
+    "dismissBreak",
+    "snoozeBreak",
+    "quit",
+]
+GUI_PREFERENCE_COMMANDS = ["setCompletionChime", "setBlinkCheckIn", "setPostureCheckIn"]
+EXPECTED_CASES = set(GUI_EVENT_COMMANDS + GUI_PREFERENCE_COMMANDS + [
+    "status",
+    "start",
+    "quit",
+])
+
+
+def fail(failures, message):
+    failures.append(message)
+
+
+def command_cases(text):
+    block = re.search(r"enum\s+TimerCommand\b.*?\n\}", text, re.S)
+    if not block:
+        return set()
+    return set(re.findall(r"case\s+([A-Za-z][A-Za-z0-9_]*)", block.group(0)))
+
+
+def main():
+    failures = []
+    for path in (PROTOCOL, SERVICE, CONTROLLER, HOST, MENU, APP, CLI):
+        if not path.is_file():
+            return [f"missing {path.relative_to(ROOT)}"]
+
+    protocol = PROTOCOL.read_text(encoding="utf-8")
+    service = SERVICE.read_text(encoding="utf-8")
+    controller = CONTROLLER.read_text(encoding="utf-8")
+    host = HOST.read_text(encoding="utf-8")
+    menu = MENU.read_text(encoding="utf-8")
+    app = APP.read_text(encoding="utf-8")
+    cli = CLI.read_text(encoding="utf-8")
+
+    cases = command_cases(protocol)
+    missing = sorted(EXPECTED_CASES - cases)
+    if missing:
+        fail(failures, f"TimerCommand is missing cases: {', '.join(missing)}")
+
+    event_block = re.search(r"var\s+timerEvent\b.*?\n    \}", protocol, re.S)
+    if not event_block:
+        fail(failures, "TimerCommand has no timerEvent mapping")
+    else:
+        event_text = event_block.group(0)
+        for command in GUI_EVENT_COMMANDS:
+            pattern = rf"case\s+\.{command}\s*:\s*\n\s*return\s+\.([A-Za-z][A-Za-z0-9_]*)"
+            if not re.search(pattern, event_text):
+                fail(failures, f"GUI command '{command}' has no TimerEvent mapping")
+
+    for command in GUI_MENU_COMMANDS:
+        if not re.search(rf"perform\(\s*\.{command}\s*\)", menu):
+            fail(failures, f"TimerMenu does not route '{command}' through perform")
+    if re.search(r"send\(\s*\.", menu):
+        fail(failures, "TimerMenu dispatches timer events directly")
+    if "NSApplication" in menu or ".terminate" in menu:
+        fail(failures, "TimerMenu bypasses the shared quit command")
+
+    if "func performTimerCommand" not in controller:
+        fail(failures, "TimerController has no shared command dispatch path")
+    for command in ("snoozeBreak", "dismissBreak", "dismissCheckIn"):
+        if not re.search(rf"performTimerCommand\(\s*\.{command}\s*\)", controller):
+            fail(failures, f"TimerController overlay control does not use '{command}'")
+    if re.search(
+        r"self\?\.send\(\s*\.(pause|resume|takeBreakNow|dismissBreak|snoozeBreak|dismissCheckIn)\b",
+        controller,
+    ):
+        fail(failures, "TimerController overlay closure dispatches a timer event directly")
+    if re.search(r"self\?\.(dismissBreak|snoozeScheduledBreak)\(\)", controller):
+        fail(failures, "TimerController overlay closure bypasses command validation")
+
+    if "controller.performTimerCommand(request.command)" not in service:
+        fail(failures, "TimerCommandService does not use the controller command dispatch path")
+    if "controller.send(event)" in service:
+        fail(failures, "TimerCommandService bypasses the controller command dispatch path")
+    for command in GUI_PREFERENCE_COMMANDS:
+        if f"case .{command}" not in service:
+            fail(failures, f"TimerCommandService does not handle '{command}'")
+    if "termination" not in service or "NSApplication.shared.terminate" not in service:
+        fail(failures, "TimerCommandService does not own the shared quit completion handler")
+    if "func execute(" not in service or "afterResponse" not in service:
+        fail(failures, "TimerCommandService does not expose the deferred response completion")
+
+    if "service.execute(request)" not in host:
+        fail(failures, "TimerCommandHost does not use the shared command execution")
+    if "execution.afterResponse" not in host or "afterReply" not in host:
+        fail(failures, "TimerCommandHost does not defer the quit completion until after the reply")
+    if "NSApplication" in host or ".terminate" in host:
+        fail(failures, "TimerCommandHost bypasses the shared quit command")
+    if "request.command == .quit" in host:
+        fail(failures, "TimerCommandHost special-cases quit instead of the shared completion")
+
+    if "perform:" not in menu:
+        fail(failures, "TimerMenu has no perform entry point")
+    if "TimerCommandService.shared" not in app:
+        fail(failures, "MyApp does not use TimerCommandService")
+    if "TimerCommandHost.shared.start()" not in app:
+        fail(failures, "MyApp does not start the command host")
+    for command in GUI_PREFERENCE_COMMANDS:
+        if f".{command}" not in app:
+            fail(failures, f"MyApp preference binding does not use '{command}'")
+
+    if "TimerCommand(rawValue: token)" not in cli:
+        fail(failures, "CLI does not accept every TimerCommand case by raw value")
+
+    print("== CLI parity guard ==")
+    print(f"TimerCommand cases: {len(cases)}")
+    print(f"GUI timer actions: {', '.join(GUI_EVENT_COMMANDS)}")
+    print(f"GUI menu actions: {', '.join(GUI_MENU_COMMANDS)}")
+    print(f"GUI preferences: {', '.join(GUI_PREFERENCE_COMMANDS)}")
+    print()
+    if failures:
+        print(f"FAIL: {len(failures)} CLI parity violation(s):")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
+    print("PASS: GUI and CLI share one validated command path.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

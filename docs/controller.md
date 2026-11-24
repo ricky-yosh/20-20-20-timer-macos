@@ -16,13 +16,29 @@ compute a sleep deadline.
 - `@Published private(set) var phase` is the read-only snapshot for the menu.
   Views send typed `TimerEvent` values through `send(_:)`; SwiftUI views contain
   no timer effects.
+- `@Published private(set) var activeCheckIn` exposes the core-owned blink or
+  posture prompt. `TimerCore` chooses the next reminder, its expiration, and the
+  suppression rules from the same event and instant input; `nextDeadline` covers
+  both warning boundaries and reminder transitions, so the controller still owns
+  exactly one pending sleep.
 - Overlay and chime routing compares the previous and new presentation.
   `clear()` runs when an overlay disappears, and the completion chime plays only
   when a break ends through `.deadlineReached` with the preference enabled.
+  Break warnings take priority over a check-in in the same routing decision.
+- The two reminder toggles are persisted through an injected
+  `CheckInPreferencesStoring` adapter. Product code uses `UserDefaults`; lifecycle
+  tests use an in-memory store, so tests never touch real preferences.
 - Display-topology changes call `redisplayOverlays()`, which re-presents the
   current overlay with the same deadline without changing timer state.
 - `TimerPlatformControlling` is injected so lifecycle tests use a recording
   fake; the real `TimerPlatform` conforms with `@MainActor` callback signatures.
+- `TimerController.performTimerCommand(_:)` is the single validation and
+  dispatch path for menu actions, overlay controls (heads-up snooze, break
+  dismiss/snooze/Escape, check-in Got it), and the CLI socket host. It rejects
+  unavailable commands before mapping `TimerCommand` values to the same
+  `TimerEvent` cases. `TimerCommandService` supplies the `Codable` status
+  snapshot, preference changes, and the shared quit completion, so the CLI
+  cannot fork the timer rules or quit ordering.
 
 ## Verification commands
 
@@ -32,12 +48,13 @@ Standalone lifecycle harness (no view mounting, no Xcode test target):
 ./run-app-lifecycle-tests.sh
 ```
 
-It builds `TimerCore` and the harness into a fresh directory created with
-`mktemp -d "${TMPDIR:-/tmp}/timer-lifecycle.XXXXXX"` and removes it on exit, so
-concurrent runs cannot collide and no fixed parent folder must exist in advance.
-Run it with `TMPDIR` pointed at any existing temporary folder to relocate the
-build. It runs 32 typed checks covering warning boundaries, snooze, early
-dismissal, sleep/unlock replay, stale callbacks, and display migration.
+It builds `TimerCore` and the harness into a fresh directory created under
+`/tmp/timer-swarm` and removes it on exit, so concurrent runs cannot collide and
+no fixed parent folder must exist in advance. It runs 104 typed checks covering
+warning boundaries, snooze, early dismissal, sleep/unlock replay, stale callbacks,
+display migration, reminder cadence and expiry, independent toggles, reminder
+suppression during pause, break, and lock, plus the shared CLI command path and
+JSON round trips.
 
 Full app typecheck with the scheme's Swift 6 settings can be reproduced from the
 repo root with the equivalent `xcodebuild` invocation:
@@ -50,7 +67,8 @@ xcodebuild -project 20-20-20-timer/20-20-20-timer.xcodeproj -scheme 20-20-20-tim
 
 In Debug builds, pass `--demo-timings` to the executable to shorten the cycle to
 a 12-second work interval, 6-second break, 8-second snooze, 6-second heads-up
-lead with a 2-second heads-up, and a 3-second final warning:
+lead with a 2-second heads-up, a 3-second final warning, a 2-second blink prompt
+at 2 seconds, and a 2-second posture prompt at 4 seconds:
 
 ```
 /tmp/timer-swarm/app-xcode-build/Build/Products/Debug/20-20-20-timer.app/Contents/MacOS/20-20-20-timer --demo-timings

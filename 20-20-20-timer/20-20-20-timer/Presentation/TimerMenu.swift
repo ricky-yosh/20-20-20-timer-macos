@@ -1,23 +1,28 @@
 import SwiftUI
-import AppKit
 import TimerCore
 
 @MainActor
 struct TimerMenu: View {
     private let phase: TimerPhase
     @Binding private var completionChime: Bool
-    private let send: @MainActor (TimerEvent) -> Void
+    @Binding private var isBlinkCheckInEnabled: Bool
+    @Binding private var isPostureCheckInEnabled: Bool
+    private let perform: @MainActor (TimerCommand) -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(
         phase: TimerPhase,
         completionChime: Binding<Bool>,
-        send: @escaping @MainActor (TimerEvent) -> Void
+        isBlinkCheckInEnabled: Binding<Bool>,
+        isPostureCheckInEnabled: Binding<Bool>,
+        perform: @escaping @MainActor (TimerCommand) -> Void
     ) {
         self.phase = phase
         _completionChime = completionChime
-        self.send = send
+        _isBlinkCheckInEnabled = isBlinkCheckInEnabled
+        _isPostureCheckInEnabled = isPostureCheckInEnabled
+        self.perform = perform
     }
 
     var body: some View {
@@ -29,9 +34,15 @@ struct TimerMenu: View {
             Toggle("Completion chime", isOn: $completionChime)
                 .toggleStyle(.switch)
                 .accessibilityHint("Plays a sound when a break finishes naturally")
+            Toggle("Blink reminders", isOn: $isBlinkCheckInEnabled)
+                .toggleStyle(.switch)
+                .accessibilityHint("Shows brief blink prompts during work intervals")
+            Toggle("Posture reminders", isOn: $isPostureCheckInEnabled)
+                .toggleStyle(.switch)
+                .accessibilityHint("Shows brief posture prompts during work intervals")
             Divider()
             Button("Quit 20-20-20 Timer") {
-                NSApplication.shared.terminate(nil)
+                perform(.quit)
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
@@ -131,25 +142,25 @@ struct TimerMenu: View {
         case .work(deadline: _, warning: _):
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
-                    Button("Pause") { send(.pause) }
+                    Button("Pause") { perform(.pause) }
                         .buttonStyle(.bordered)
-                    Button("Take Break Now") { send(.takeBreakNow) }
+                    Button("Take Break Now") { perform(.takeBreakNow) }
                         .buttonStyle(.borderedProminent)
                 }
                 if let snoozeTitle {
-                    Button(snoozeTitle) { send(.snoozeScheduledBreak) }
+                    Button(snoozeTitle) { perform(.snoozeBreak) }
                         .buttonStyle(.bordered)
                 }
             }
         case .paused(remaining: _):
             HStack(spacing: 8) {
-                Button("Resume") { send(.resume) }
+                Button("Resume") { perform(.resume) }
                     .buttonStyle(.bordered)
-                Button("Take Break Now") { send(.takeBreakNow) }
+                Button("Take Break Now") { perform(.takeBreakNow) }
                     .buttonStyle(.borderedProminent)
             }
         case .onBreak(deadline: _, origin: _):
-            Button("End Break") { send(.dismissBreak) }
+            Button("End Break") { perform(.dismissBreak) }
                 .buttonStyle(.bordered)
         case .suspended:
             EmptyView()

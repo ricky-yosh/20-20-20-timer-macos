@@ -39,7 +39,7 @@ so no work runs while hidden.
 ## Breaks
 
 A break creates one borderless `NSPanel` per connected `NSScreen`, each hosting
-`BreakOverlayView` with the slowly shifting gradient. Non-control panels ignore
+`BreakOverlayView` over the calm charcoal background. Non-control panels ignore
 mouse events and show only the background. The panel on the display containing
 the pointer at break start is the control panel: it accepts mouse and keyboard
 input, overrides `canBecomeKey` so the borderless panel can actually become key,
@@ -56,6 +56,17 @@ disconnected, the controls migrate to a remaining display while the original
 deadline and callbacks are unchanged. Repeated `showBreak` calls with the same
 deadline update panels without restarting the break, re-announcing it or moving
 the controls.
+
+## Check-ins
+
+A blink or posture check-in uses the same borderless nonactivating panel shape as
+the heads-up, hosted by `CheckInView` and placed top-right on the pointer's
+display. The panel is never made key, so the frontmost app and caret keep focus.
+The core owns the prompt deadline; the adapter only fades the panel in, moves it
+when display topology changes, and fades it out when the controller clears it.
+The `Got it` button routes a typed `.dismissCheckIn` event rather than dismissing
+the panel on its own. Reduce Motion switches the icon reveal to an immediate
+still presentation.
 
 ## Display topology
 
@@ -74,3 +85,29 @@ transition when Reduce Motion is enabled. Break start and end are each announced
 once through the AppKit `NSAccessibility` announcement request; topology updates
 and repeated clear calls do not duplicate them. The completion chime is played
 with `NSSound`, stopped before replay so rapid completions do not overlap.
+
+## Command transport
+
+`TimerCommandHost` owns the app-side socket server. It derives the endpoint from
+the app's real home directory and `Bundle.main.bundleIdentifier`, so the socket
+lives at `~/Library/Containers/<bundle-id>/Data/tmp/tc/s` even though the app is
+sandboxed. `TimerCommandTransport` creates a 0700 endpoint directory, a 0600
+socket, a 0600 lock file, and verifies the peer UID with `getpeereid`. Frames are
+bounded to 64 KiB and the server handles one request at a time off the main actor.
+
+The handler decodes `TimerCommandRequest`, calls the main-actor
+`TimerCommandService.execute`, and encodes `TimerCommandExecution.response`. A
+quit request carries the service's shared termination completion as the
+transport's after-reply hook; the transport writes and shuts down that response
+before the hook calls `NSApplication.shared.terminate(nil)`. Quit therefore
+acknowledges the CLI before the normal app termination path runs, while the menu
+quit button uses the same command and completion immediately. The server start
+failure is logged and does not stop the menu bar timer.
+
+## Menu bar status label
+
+`TimerStatusItemLabel` updates its displayed countdown from a view-local
+one-second Combine ticker. A `TimelineView` or self-updating `Text` inside a
+`MenuBarExtra` label caused an endless `makeMenuBarExtras` update loop during
+launch on this macOS/Xcode combination, so the label uses an explicit display
+tick that never starts, advances, pauses, or reschedules the timer.

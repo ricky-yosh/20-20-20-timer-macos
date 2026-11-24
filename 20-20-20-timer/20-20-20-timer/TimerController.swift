@@ -10,7 +10,10 @@ private let demoTimerConfiguration = TimerConfiguration(
     snoozeInterval: .seconds(8),
     headsUpLead: .seconds(6),
     headsUpDuration: .seconds(2),
-    finalWarningDuration: .seconds(3)
+    finalWarningDuration: .seconds(3),
+    checkInDuration: .seconds(2),
+    blinkCheckInOffsets: [.seconds(2)],
+    postureCheckInOffsets: [.seconds(4)]
 )
 #endif
 
@@ -51,11 +54,18 @@ protocol TimerPlatformControlling: AnyObject {
         dismiss: @escaping @MainActor () -> Void,
         snooze: (@MainActor () -> Void)?
     )
+    func showCheckIn(origin: CheckInOrigin, dismiss: @escaping @MainActor () -> Void)
     func clear()
     func playCompletionChime()
 }
 
 extension TimerPlatform: TimerPlatformControlling {}
+
+enum TimerCommandDispatchResult: Equatable {
+    case performed
+    case unavailable
+    case notHandled
+}
 
 @MainActor
 final class TimerController: ObservableObject {
@@ -71,6 +81,9 @@ final class TimerController: ObservableObject {
     }()
 
     @Published private(set) var phase: TimerPhase
+    @Published private(set) var activeCheckIn: ActiveCheckIn?
+    @Published private(set) var isBlinkCheckInEnabled: Bool
+    @Published private(set) var isPostureCheckInEnabled: Bool
     @Published var completionChime = false
 
     private var state: TimerState
@@ -79,17 +92,27 @@ final class TimerController: ObservableObject {
     private var started = false
     private let clock: TimerClock
     private let platform: any TimerPlatformControlling
+    private let preferences: any CheckInPreferencesStoring
 
     init(
         platform: any TimerPlatformControlling,
         clock: TimerClock? = nil,
+        preferences: any CheckInPreferencesStoring = UserDefaultsCheckInPreferences(),
         configuration: TimerConfiguration = .productDefault,
         now: ContinuousClock.Instant = ContinuousClock.now
     ) {
+        let settings = CheckInSettings(
+            blinkEnabled: preferences.isBlinkCheckInEnabled,
+            postureEnabled: preferences.isPostureCheckInEnabled
+        )
         self.platform = platform
         self.clock = clock ?? .systemClock()
-        self.state = TimerState(configuration: configuration, now: now)
+        self.preferences = preferences
+        self.isBlinkCheckInEnabled = settings.blinkEnabled
+        self.isPostureCheckInEnabled = settings.postureEnabled
+        self.state = TimerState(configuration: configuration, checkInSettings: settings, now: now)
         self.phase = state.phase
+        self.activeCheckIn = state.activeCheckIn
     }
 
     deinit {
@@ -117,32 +140,90 @@ final class TimerController: ObservableObject {
         platform.clear()
     }
 
+    var currentInstant: ContinuousClock.Instant {
+        clock.now()
+    }
+
+    func setCompletionChimeEnabled(_ enabled: Bool) {
+        completionChime = enabled
+    }
+
+    func setBlinkCheckInEnabled(_ enabled: Bool) {
+        guard enabled != isBlinkCheckInEnabled else { return }
+        isBlinkCheckInEnabled = enabled
+        preferences.isBlinkCheckInEnabled = enabled
+        send(.updateCheckInSettings(checkInSettings))
+    }
+
+    func setPostureCheckInEnabled(_ enabled: Bool) {
+        guard enabled != isPostureCheckInEnabled else { return }
+        isPostureCheckInEnabled = enabled
+        preferences.isPostureCheckInEnabled = enabled
+        send(.updateCheckInSettings(checkInSettings))
+    }
+
+    @discardableResult
+    func performTimerCommand(_ command: TimerCommand) -> TimerCommandDispatchResult {
+        switch command {
+        case .start:
+            start()
+            return .performed
+        case .pause, .resume, .takeBreakNow, .dismissBreak, .snoozeBreak, .dismissCheckIn:
+            guard command.isAvailable(in: phase, activeCheckIn: activeCheckIn),
+                  let event = command.timerEvent else {
+                return .unavailable
+            }
+            send(event)
+            return .performed
+        case .status, .quit, .setCompletionChime, .setBlinkCheckIn, .setPostureCheckIn:
+            return .notHandled
+        }
+    }
+
     func send(_ event: TimerEvent) {
         send(event, now: clock.now())
     }
 
     func send(_ event: TimerEvent, now: ContinuousClock.Instant) {
-        let previous = state.phase
+        let previousPhase = state.phase
+        let previousCheckIn = state.activeCheckIn
         state.handle(event, now: now)
-        let current = state.phase
-        phase = current
-        if current != previous {
-            route(from: overlay(for: previous), to: overlay(for: current), event: event)
+        let currentPhase = state.phase
+        let currentCheckIn = state.activeCheckIn
+        if phase != currentPhase {
+            phase = currentPhase
+        }
+        if activeCheckIn != currentCheckIn {
+            activeCheckIn = currentCheckIn
+        }
+        if currentPhase != previousPhase || currentCheckIn != previousCheckIn {
+            route(
+                from: overlay(for: previousPhase, checkIn: previousCheckIn),
+                to: overlay(for: currentPhase, checkIn: currentCheckIn),
+                event: event
+            )
         }
         scheduleNext()
     }
 
-    func pause() { send(.pause) }
-    func resume() { send(.resume) }
-    func takeBreakNow() { send(.takeBreakNow) }
-    func snoozeScheduledBreak() { send(.snoozeScheduledBreak) }
-    func dismissBreak() { send(.dismissBreak) }
+    func pause() { performTimerCommand(.pause) }
+    func resume() { performTimerCommand(.resume) }
+    func takeBreakNow() { performTimerCommand(.takeBreakNow) }
+    func snoozeScheduledBreak() { performTimerCommand(.snoozeBreak) }
+    func dismissBreak() { performTimerCommand(.dismissBreak) }
     func screenUnavailable() { send(.screenUnavailable) }
     func screenAvailable() { send(.screenAvailable) }
 
     func deadlineReached(token: UInt64, deadline: ContinuousClock.Instant) {
         guard token == generation, state.nextDeadline == deadline else { return }
         send(.deadlineReached)
+    }
+
+    private var checkInSettings: CheckInSettings {
+        CheckInSettings(
+            blinkEnabled: isBlinkCheckInEnabled,
+            postureEnabled: isPostureCheckInEnabled
+        )
     }
 
     private func scheduleNext() {
@@ -171,7 +252,7 @@ final class TimerController: ObservableObject {
     }
 
     private func redisplayOverlays() {
-        present(overlay(for: phase))
+        present(overlay(for: phase, checkIn: activeCheckIn))
     }
 
     private func present(_ overlay: Overlay) {
@@ -179,27 +260,38 @@ final class TimerController: ObservableObject {
         case .none:
             break
         case .headsUp:
-            platform.showHeadsUp { [weak self] in self?.snoozeScheduledBreak() }
+            platform.showHeadsUp { [weak self] in
+                self?.performTimerCommand(.snoozeBreak)
+            }
         case .finalCountdown(let deadline):
             platform.showFinalCountdown(deadline: deadline)
         case .onBreak(let deadline, let origin):
-            let dismiss: @MainActor () -> Void = { [weak self] in self?.dismissBreak() }
+            let dismiss: @MainActor () -> Void = { [weak self] in
+                self?.performTimerCommand(.dismissBreak)
+            }
             let snooze: (@MainActor () -> Void)?
             switch origin {
             case .scheduled:
-                snooze = { [weak self] in self?.snoozeScheduledBreak() }
+                snooze = { [weak self] in self?.performTimerCommand(.snoozeBreak) }
             case .onDemand:
                 snooze = nil
             }
             platform.showBreak(deadline: deadline, origin: origin, dismiss: dismiss, snooze: snooze)
+        case .checkIn(let origin):
+            platform.showCheckIn(origin: origin) { [weak self] in
+                self?.performTimerCommand(.dismissCheckIn)
+            }
         }
     }
 
-    private func overlay(for phase: TimerPhase) -> Overlay {
+    private func overlay(for phase: TimerPhase, checkIn: ActiveCheckIn?) -> Overlay {
         switch phase {
         case .work(let deadline, let warning):
             switch warning {
             case .none:
+                if let checkIn {
+                    return .checkIn(origin: checkIn.origin)
+                }
                 return .none
             case .headsUp:
                 return .headsUp
@@ -218,5 +310,6 @@ final class TimerController: ObservableObject {
         case headsUp
         case finalCountdown(deadline: ContinuousClock.Instant)
         case onBreak(deadline: ContinuousClock.Instant, origin: BreakOrigin)
+        case checkIn(origin: CheckInOrigin)
     }
 }

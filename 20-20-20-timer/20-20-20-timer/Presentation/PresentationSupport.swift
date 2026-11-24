@@ -50,60 +50,12 @@ struct RemainingTime: Equatable, Sendable {
     }
 }
 
-struct ShiftingBreakBackground: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private static let palette: [Color] = [
-        Color(red: 0.043, green: 0.102, blue: 0.196),
-        Color(red: 0.129, green: 0.180, blue: 0.388),
-        Color(red: 0.106, green: 0.322, blue: 0.357),
-        Color(red: 0.247, green: 0.129, blue: 0.302),
-        Color(red: 0.043, green: 0.102, blue: 0.196),
-    ]
+struct CharcoalBackground: View {
+    private let color: Color = Color(red: 0.1, green: 0.1, blue: 0.13)
 
     var body: some View {
-        if reduceMotion {
-            composition(phase: 0.18)
-        } else {
-            TimelineView(.animation(minimumInterval: 1.0 / 20.0)) { context in
-                composition(phase: Self.phase(at: context.date))
-            }
-        }
-    }
-
-    private func composition(phase: Double) -> some View {
-        GeometryReader { proxy in
-            let radius = max(proxy.size.width, proxy.size.height) * 0.85
-            ZStack {
-                LinearGradient(
-                    colors: Self.palette,
-                    startPoint: Self.unitPoint(phase: phase),
-                    endPoint: Self.unitPoint(phase: phase + 0.5)
-                )
-                RadialGradient(
-                    colors: [Color.white.opacity(0.14), Color.white.opacity(0.02), Color.clear],
-                    center: Self.unitPoint(phase: phase + 0.25),
-                    startRadius: 0,
-                    endRadius: radius
-                )
-                LinearGradient(
-                    colors: [Color.black.opacity(0.28), Color.clear, Color.black.opacity(0.22)],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            }
-        }
-        .ignoresSafeArea()
-    }
-
-    private static func phase(at date: Date) -> Double {
-        let seconds = date.timeIntervalSinceReferenceDate
-        return (seconds / 72).truncatingRemainder(dividingBy: 1)
-    }
-
-    private static func unitPoint(phase: Double) -> UnitPoint {
-        let angle = phase * 2 * Double.pi
-        return UnitPoint(x: 0.5 + 0.5 * cos(angle), y: 0.5 + 0.5 * sin(angle))
+        color
+            .ignoresSafeArea()
     }
 }
 
